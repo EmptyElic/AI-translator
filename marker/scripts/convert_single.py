@@ -44,7 +44,11 @@ def convert_single_cli(fpath: str, **kwargs):
     )
     rendered = converter(fpath)
     if translation_target:
-        rendered = translate_rendered_output(rendered, translation_target)
+        rendered = translate_rendered_output(
+            rendered,
+            translation_target,
+            llm_service=models.get("llm_service"),
+        )
     out_folder = config_parser.get_output_folder(fpath)
     save_output(rendered, out_folder, config_parser.get_base_filename(fpath))
 

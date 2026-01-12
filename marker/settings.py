@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     OUTPUT_DIR: str = os.path.join(BASE_DIR, "conversion_results")
     FONT_DIR: str = os.path.join(BASE_DIR, "static", "fonts")
     DEBUG_DATA_FOLDER: str = os.path.join(BASE_DIR, "debug_data")
+    HF_CACHE_DIR: str = os.path.join(BASE_DIR, ".hf_cache")
     ARTIFACT_URL: str = "https://models.datalab.to/artifacts"
     FONT_NAME: str = "GoNotoCurrent-Regular.ttf"
     FONT_PATH: str = os.path.join(FONT_DIR, FONT_NAME)
