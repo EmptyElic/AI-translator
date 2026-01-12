@@ -33,6 +33,7 @@ from marker.config.printer import CustomClickPrinter
 from marker.logger import configure_logging, get_logger
 from marker.models import create_model_dict
 from marker.output import output_exists, save_output
+from marker.translation import translate_rendered_output
 from marker.utils.gpu import GPUManager
 
 configure_logging()
@@ -85,6 +86,9 @@ def process_single_pdf(args):
             llm_service=config_parser.get_llm_service(),
         )
         rendered = converter(fpath)
+        translation_target = cli_options.get("translate")
+        if translation_target:
+            rendered = translate_rendered_output(rendered, translation_target)
         out_folder = config_parser.get_output_folder(fpath)
         save_output(rendered, out_folder, base_name)
         page_count = converter.page_count
@@ -137,6 +141,12 @@ def process_single_pdf(args):
 )
 @ConfigParser.common_options
 def convert_cli(in_folder: str, **kwargs):
+    translation_target = kwargs.get("translate")
+    if translation_target and kwargs.get("output_format") != "markdown":
+        raise click.BadParameter(
+            "Translation is currently supported only for markdown output. "
+            "Please rerun with --output_format markdown."
+        )
     total_pages = 0
     in_folder = os.path.abspath(in_folder)
     files = [os.path.join(in_folder, f) for f in os.listdir(in_folder)]

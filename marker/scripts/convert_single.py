@@ -14,6 +14,7 @@ from marker.config.printer import CustomClickPrinter
 from marker.logger import configure_logging, get_logger
 from marker.models import create_model_dict
 from marker.output import save_output
+from marker.translation import translate_rendered_output
 
 configure_logging()
 logger = get_logger()
@@ -25,6 +26,12 @@ logger = get_logger()
 def convert_single_cli(fpath: str, **kwargs):
     models = create_model_dict()
     start = time.time()
+    translation_target = kwargs.get("translate")
+    if translation_target and kwargs.get("output_format") != "markdown":
+        raise click.BadParameter(
+            "Translation is currently supported only for markdown output. "
+            "Please rerun with --output_format markdown."
+        )
     config_parser = ConfigParser(kwargs)
 
     converter_cls = config_parser.get_converter_cls()
@@ -36,6 +43,8 @@ def convert_single_cli(fpath: str, **kwargs):
         llm_service=config_parser.get_llm_service(),
     )
     rendered = converter(fpath)
+    if translation_target:
+        rendered = translate_rendered_output(rendered, translation_target)
     out_folder = config_parser.get_output_folder(fpath)
     save_output(rendered, out_folder, config_parser.get_base_filename(fpath))
 
