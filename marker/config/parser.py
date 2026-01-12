@@ -67,6 +67,12 @@ class ConfigParser:
             default=None,
             help="Page range to convert, specify comma separated page numbers or ranges.  Example: 0,5-10,20",
         )(fn)
+        fn = click.option(
+            "--translate",
+            type=str,
+            default=None,
+            help="Translate the output into the specified target language (e.g., 'Russian').",
+        )(fn)
 
         # we put common options here
         fn = click.option(
