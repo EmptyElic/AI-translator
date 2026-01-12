@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Dict, Iterable, List
+from typing import Dict, List
 
 from rapidfuzz import process
 from transformers import pipeline
