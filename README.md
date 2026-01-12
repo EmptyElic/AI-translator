@@ -118,6 +118,7 @@ Options:
 - `config --help`: List all available builders, processors, and converters, and their associated configuration.  These values can be used to build a JSON configuration file for additional tweaking of marker defaults.
 - `--converter_cls`: One of `marker.converters.pdf.PdfConverter` (default) or `marker.converters.table.TableConverter`.  The `PdfConverter` will convert the whole PDF, the `TableConverter` will only extract and convert tables.
 - `--llm_service`: Which llm service to use if `--use_llm` is passed.  This defaults to `marker.services.gemini.GoogleGeminiService`.
+- `--translate TEXT`: Translate the rendered markdown into the target language (currently `Russian`). The flag accepts either the language name or a common alias (for example, `--translate Russian` or `--translate Russin`).
 - `--help`: see all of the flags that can be passed into marker.  (it supports many more options then are listed above)
 
 The list of supported languages for surya OCR is [here](https://github.com/VikParuchuri/surya/blob/master/surya/recognition/languages.py).  If you don't need OCR, marker can work with any language.
@@ -250,6 +251,21 @@ You can also run this via the CLI with
 ```shell
 marker_single FILENAME --converter_cls marker.converters.ocr.OCRConverter
 ```
+
+### Neural translation (markdown output)
+
+Marker can optionally translate the parsed markdown via a lightweight neural MT pipeline. Pass `--translate <language>` together with `--output_format markdown` (translation is not yet supported for other formats). Currently, Russian is available out-of-the-box using the Helsinki-NLP English→Russian model, including fuzzy matching for common aliases (for example, `--translate Russin` is accepted).
+
+Example:
+
+```shell
+/path/to/.venv/bin/python convert_single.py 2601.00100v1.pdf \
+  --output_format markdown \
+  --output_dir ./out \
+  --translate Russin
+```
+
+The resulting `*.md` file will contain Russian text, and the accompanying metadata will describe which translation model was used. Repeated runs reuse the cached HuggingFace pipeline weights automatically.
 
 ### Structured Extraction (beta)
 
