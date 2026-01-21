@@ -12,6 +12,26 @@ from marker.services import BaseService
 logger = get_logger()
 
 
+def _simple_string_field(schema: dict) -> str | None:
+    """
+    Return the field name if the schema represents a single required string property.
+    """
+    if not schema:
+        return None
+
+    properties = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    if len(properties) != 1:
+        return None
+
+    field_name, field_schema = next(iter(properties.items()))
+    field_type = field_schema.get("type")
+    if field_type == "string" and field_name in required:
+        return field_name
+
+    return None
+
+
 class OllamaService(BaseService):
     ollama_base_url: Annotated[
         str, "The base url to use for ollama.  No trailing slash."
@@ -39,9 +59,10 @@ class OllamaService(BaseService):
         schema = response_schema.model_json_schema()
         format_schema = {
             "type": "object",
-            "properties": schema["properties"],
-            "required": schema["required"],
+            "properties": schema.get("properties", {}),
+            "required": schema.get("required", []),
         }
+        simple_string_field = _simple_string_field(format_schema)
 
         image_bytes = self.format_image_for_llm(image)
 
@@ -49,24 +70,35 @@ class OllamaService(BaseService):
             "model": self.ollama_model,
             "prompt": prompt,
             "stream": False,
-            "format": format_schema,
             "images": image_bytes,
         }
+        if not simple_string_field:
+            payload["format"] = format_schema
 
         try:
-            response = requests.post(url, json=payload, headers=headers)
+            response = requests.post(url, json=payload, headers=headers, timeout=timeout)
             response.raise_for_status()
             response_data = response.json()
 
-            total_tokens = (
-                response_data["prompt_eval_count"] + response_data["eval_count"]
-            )
+            prompt_tokens = response_data.get("prompt_eval_count")
+            completion_tokens = response_data.get("eval_count")
+            total_tokens = None
+            if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+                total_tokens = prompt_tokens + completion_tokens
 
-            if block:
+            if block and total_tokens is not None:
                 block.update_metadata(llm_request_count=1, llm_tokens_used=total_tokens)
 
-            data = response_data["response"]
-            return json.loads(data)
+            data = response_data.get("response", "")
+            if not data:
+                raise ValueError("Empty response payload from Ollama")
+
+            if simple_string_field:
+                parsed = {simple_string_field: data.strip()}
+            else:
+                parsed = json.loads(data)
+
+            return response_schema.model_validate(parsed)
         except Exception as e:
             logger.warning(f"Ollama inference failed: {e}")
 

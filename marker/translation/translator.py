@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from textwrap import dedent
 from typing import Dict, List, Optional
 
 from rapidfuzz import process
@@ -15,9 +17,56 @@ logger = get_logger()
 LANGUAGE_REGISTRY: Dict[str, Dict[str, str]] = {
     "ru": {
         "display_name": "Russian",
+        "native_name": "русский",
         "code": "ru",
     },
 }
+
+PROMPT_TEMPLATE = dedent(
+    """
+    You are a precise technical translator.
+    Convert the Markdown content delimited by <MARKDOWN> and </MARKDOWN> into {language_display} ({language_native}).
+    STRICT RULES:
+    - Preserve Markdown structure, LaTeX math, code fences, HTML spans/anchors, metadata.
+    - Do NOT translate inside fenced code blocks, LaTeX, HTML attributes, identifiers.
+    - Output ONLY the translated Markdown, no explanations, greetings, or confirmations.
+    - Do not wrap the answer in XML/JSON or repeat the prompt.
+
+    <MARKDOWN>
+    {content}
+    </MARKDOWN>
+    """
+).strip()
+
+MAX_TRANSLATION_CHARS = 1200
+MAX_TRANSLATION_ATTEMPTS = 4
+MIN_CYRILLIC_RATIO = 0.25
+MIN_CYRILLIC_ABSOLUTE = 25
+
+NOISE_PREFIXES = [
+    "привет",
+    "ок",
+    "okay",
+    "ok.",
+    "ok!",
+    "выполнено",
+    "готово",
+    "here is the translated content",
+    "please provide",
+    "scrolling",
+    "ниже",
+    "ниже мы",
+    "перевод:",
+    "translation:",
+    "the translated text is",
+]
+
+NOISE_REGEX = re.compile(
+    r"^(?:\s*(?:#+\s*)?(?:"
+    + "|".join(re.escape(prefix) for prefix in NOISE_PREFIXES)
+    + r")[:!,. ]*)",
+    re.IGNORECASE,
+)
 
 LANGUAGE_ALIASES = {
     "ru": "ru",
@@ -25,6 +74,8 @@ LANGUAGE_ALIASES = {
     "russian": "ru",
     "русский": "ru",
 }
+
+CODE_FENCE_PATTERN = re.compile(r"^\s*`{3,}")
 
 
 def _resolve_language(language: str) -> Dict[str, str]:
@@ -48,23 +99,66 @@ def _resolve_language(language: str) -> Dict[str, str]:
     )
 
 
-def _chunk_text(text: str, max_chunk_chars: int = 2500) -> List[str]:
-    paragraphs = text.split("\n\n")
+def _chunk_text(text: str, max_chunk_chars: int = MAX_TRANSLATION_CHARS) -> List[str]:
+    """
+    Split markdown into translation-friendly chunks while preserving code fences
+    and structural boundaries (headings/blank lines) whenever possible.
+    """
+
+    if not text:
+        return [text]
+
+    lines = text.splitlines(keepends=True)
     chunks: List[str] = []
-    current = ""
+    current: List[str] = []
+    current_len = 0
+    inside_code_fence = False
+    fence_delimiter = ""
 
-    for idx, paragraph in enumerate(paragraphs):
-        if idx < len(paragraphs) - 1:
-            paragraph += "\n\n"
+    def flush_current():
+        nonlocal current, current_len
+        if current:
+            chunks.append("".join(current))
+            current = []
+            current_len = 0
 
-        if len(current) + len(paragraph) > max_chunk_chars and current:
-            chunks.append(current)
-            current = paragraph
-        else:
-            current += paragraph
+    for line in lines:
+        stripped = line.strip()
 
-    if current:
-        chunks.append(current)
+        if CODE_FENCE_PATTERN.match(stripped):
+            if not inside_code_fence:
+                inside_code_fence = True
+                fence_delimiter = stripped.split()[0]
+            elif not fence_delimiter or stripped.startswith(fence_delimiter):
+                inside_code_fence = False
+                fence_delimiter = ""
+
+        def needs_split() -> bool:
+            if not current or inside_code_fence:
+                return False
+            if current_len + len(line) > max_chunk_chars:
+                return True
+            if not stripped and current_len >= int(max_chunk_chars * 0.8):
+                return True
+            if stripped.startswith("#") and current_len >= int(max_chunk_chars * 0.6):
+                return True
+            return False
+
+        if needs_split():
+            flush_current()
+
+        current.append(line)
+        current_len += len(line)
+
+        # Extreme fallback: if a single fenced block wildly exceeds max size,
+        # allow splitting after closing fence to avoid unbounded chunks.
+        if (
+            not inside_code_fence
+            and current_len >= max_chunk_chars * 2
+        ):
+            flush_current()
+
+    flush_current()
 
     return chunks or [text]
 
@@ -73,29 +167,118 @@ class TranslationResponse(BaseModel):
     translation: str
 
 
+def _clean_translated_output(text: str) -> str:
+    """
+    Remove residual prompt echoes or injected instructions from the translated output.
+    """
+    if not text:
+        return text
+
+    cleaned = text.replace("<MARKDOWN>", "").replace("</MARKDOWN>", "").strip()
+
+    cleaned = NOISE_REGEX.sub("", cleaned).lstrip()
+    lines = cleaned.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    cleaned = "\n".join(lines)
+
+    markers = [
+        "you are a precise technical translator",
+        "convert the following markdown",
+        "return only the translated markdown",
+        "below is the markdown content",
+    ]
+    lowered = cleaned.lower()
+    for marker in markers:
+        idx = lowered.find(marker)
+        if idx != -1:
+            cleaned = cleaned[:idx].rstrip()
+            lowered = cleaned.lower()
+
+    return cleaned
+
+
+def _is_cyrillic_char(ch: str) -> bool:
+    if ch in ("ё", "Ё"):
+        return True
+    codepoint = ord(ch)
+    return 0x0400 <= codepoint <= 0x052F
+
+
+def _translation_is_valid(original: str, translated: str) -> bool:
+    if not translated.strip():
+        return False
+
+    lower = translated.strip().lower()
+    if lower.startswith(("please provide", "here is the", "i'm sorry")):
+        return False
+
+    alpha_count = sum(1 for ch in translated if ch.isalpha())
+    cyrillic_count = sum(1 for ch in translated if _is_cyrillic_char(ch))
+
+    if alpha_count == 0:
+        # Mostly equations / symbols. Accept as-is.
+        return True
+
+    if cyrillic_count >= MIN_CYRILLIC_ABSOLUTE:
+        return True
+
+    ratio = cyrillic_count / max(alpha_count, 1)
+    return ratio >= MIN_CYRILLIC_RATIO
+
+
 def _translate_chunk(
     llm_service: BaseService,
     chunk: str,
-    target_language: str,
+    language_info: Dict[str, str],
     temperature: float = 0.1,
 ) -> str:
     if not chunk.strip():
         return chunk
 
-    prompt = (
-        "You are a precise technical translator. Convert the following Markdown content "
-        f"to {target_language}. Preserve Markdown structure, LaTeX expressions, code blocks, "
-        "and inline formatting. Return only the translated Markdown without explanations.\n\n"
-        f"Markdown:\n{chunk}"
+    prompt_base = PROMPT_TEMPLATE.format(
+        language_display=language_info["display_name"],
+        language_native=language_info.get("native_name", language_info["display_name"]),
+        content=chunk,
     )
-    response = llm_service(
-        prompt=prompt,
-        image=None,
-        block=None,
-        response_schema=TranslationResponse,
-        timeout=getattr(llm_service, "timeout", None),
-    )
-    return response.translation.strip()
+
+    for attempt in range(1, MAX_TRANSLATION_ATTEMPTS + 1):
+        prompt = prompt_base
+        if attempt > 1:
+            prompt += (
+                "\n\nREMINDER: Output ONLY the translated Markdown in "
+                f"{language_info['display_name']} with no extra comments."
+            )
+
+        response = llm_service(
+            prompt=prompt,
+            image=None,
+            block=None,
+            response_schema=TranslationResponse,
+            timeout=getattr(llm_service, "timeout", None),
+        )
+
+        if isinstance(response, dict):
+            translation_text = response.get("translation", "")
+        else:
+            translation_text = response.translation
+
+        if not isinstance(translation_text, str):
+            logger.warning("LLM translation payload missing text. Attempt %s", attempt)
+            continue
+
+        cleaned = _clean_translated_output(translation_text.strip())
+        if _translation_is_valid(chunk, cleaned):
+            return cleaned
+
+        logger.warning(
+            "LLM translation looked invalid on attempt %s/%s; retrying.",
+            attempt,
+            MAX_TRANSLATION_ATTEMPTS,
+        )
+
+    logger.error("LLM translation failed; returning original chunk.")
+    return chunk
 
 
 def translate_rendered_output(
@@ -118,7 +301,7 @@ def translate_rendered_output(
     language_info = _resolve_language(target_language)
     chunks = _chunk_text(rendered.markdown)
     translated_segments = [
-        _translate_chunk(llm_service, chunk, language_info["display_name"]) for chunk in chunks
+        _translate_chunk(llm_service, chunk, language_info) for chunk in chunks
     ]
     rendered.markdown = "".join(translated_segments)
 
