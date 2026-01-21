@@ -232,9 +232,12 @@ def _translate_chunk(
     chunk: str,
     language_info: Dict[str, str],
     temperature: float = 0.1,
+    chunk_id: int | None = None,
 ) -> str:
     if not chunk.strip():
         return chunk
+
+    chunk_label = f"#{chunk_id + 1}" if chunk_id is not None else "n/a"
 
     prompt_base = PROMPT_TEMPLATE.format(
         language_display=language_info["display_name"],
@@ -250,12 +253,26 @@ def _translate_chunk(
                 f"{language_info['display_name']} with no extra comments."
             )
 
+        logger.info(
+            "Translation chunk %s attempt %s prompt:\n%s",
+            chunk_label,
+            attempt,
+            prompt,
+        )
+
         response = llm_service(
             prompt=prompt,
             image=None,
             block=None,
             response_schema=TranslationResponse,
             timeout=getattr(llm_service, "timeout", None),
+        )
+
+        logger.info(
+            "Translation chunk %s attempt %s raw response: %s",
+            chunk_label,
+            attempt,
+            response,
         )
 
         if isinstance(response, dict):
@@ -301,7 +318,8 @@ def translate_rendered_output(
     language_info = _resolve_language(target_language)
     chunks = _chunk_text(rendered.markdown)
     translated_segments = [
-        _translate_chunk(llm_service, chunk, language_info) for chunk in chunks
+        _translate_chunk(llm_service, chunk, language_info, chunk_id=idx)
+        for idx, chunk in enumerate(chunks)
     ]
     rendered.markdown = "".join(translated_segments)
 
