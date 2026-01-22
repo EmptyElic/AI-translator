@@ -40,33 +40,35 @@ PROMPT_TEMPLATE = dedent(
 
 MAX_TRANSLATION_CHARS = 1200
 MAX_TRANSLATION_ATTEMPTS = 4
+MAX_POST_EDIT_ATTEMPTS = 2
 MIN_CYRILLIC_RATIO = 0.25
 MIN_CYRILLIC_ABSOLUTE = 25
+ENABLE_TRANSLATION_POST_EDIT = True
 
-NOISE_PREFIXES = [
-    "привет",
-    "ок",
-    "okay",
-    "ok.",
-    "ok!",
-    "выполнено",
-    "готово",
-    "here is the translated content",
-    "please provide",
-    "scrolling",
-    "ниже",
-    "ниже мы",
-    "перевод:",
-    "translation:",
-    "the translated text is",
-]
+# NOISE_PREFIXES = [
+#     "привет",
+#     "ок",
+#     "okay",
+#     "ok.",
+#     "ok!",
+#     "выполнено",
+#     "готово",
+#     "here is the translated content",
+#     "please provide",
+#     "scrolling",
+#     "ниже",
+#     "ниже мы",
+#     "перевод:",
+#     "translation:",
+#     "the translated text is",
+# ]
 
-NOISE_REGEX = re.compile(
-    r"^(?:\s*(?:#+\s*)?(?:"
-    + "|".join(re.escape(prefix) for prefix in NOISE_PREFIXES)
-    + r")[:!,. ]*)",
-    re.IGNORECASE,
-)
+# NOISE_REGEX = re.compile(
+#     r"^(?:\s*(?:#+\s*)?(?:"
+#     + "|".join(re.escape(prefix) for prefix in NOISE_PREFIXES)
+#     + r")[:!,. ]*)",
+#     re.IGNORECASE,
+# )
 
 LANGUAGE_ALIASES = {
     "ru": "ru",
@@ -167,6 +169,25 @@ class TranslationResponse(BaseModel):
     translation: str
 
 
+class PostEditResponse(BaseModel):
+    corrected_markdown: str
+
+
+POST_EDIT_PROMPT_TEMPLATE = dedent(
+    """
+    You are a meticulous editor.
+    Polish the Markdown between <MARKDOWN> and </MARKDOWN> which is already in {language_display}.
+    Fix spacing, duplicated fragments, tables, leftover foreign words, punctuation, and obvious hallucinated artifacts,
+    but DO NOT delete sentences, do not summarize, and do not remove math, tables, links, or HTML tags.
+    Preserve structure exactly and return only the corrected Markdown.
+
+    <MARKDOWN>
+    {content}
+    </MARKDOWN>
+    """
+).strip()
+
+
 def _clean_translated_output(text: str) -> str:
     """
     Remove residual prompt echoes or injected instructions from the translated output.
@@ -176,11 +197,11 @@ def _clean_translated_output(text: str) -> str:
 
     cleaned = text.replace("<MARKDOWN>", "").replace("</MARKDOWN>", "").strip()
 
-    cleaned = NOISE_REGEX.sub("", cleaned).lstrip()
-    lines = cleaned.splitlines()
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    cleaned = "\n".join(lines)
+    # cleaned = NOISE_REGEX.sub("", cleaned).lstrip()
+    # lines = cleaned.splitlines()
+    # while lines and not lines[0].strip():
+    #     lines.pop(0)
+    # cleaned = "\n".join(lines)
 
     markers = [
         "you are a precise technical translator",
@@ -298,6 +319,69 @@ def _translate_chunk(
     return chunk
 
 
+def _post_edit_chunk(
+    llm_service: BaseService,
+    chunk: str,
+    language_info: Dict[str, str],
+    chunk_id: int | None = None,
+) -> str:
+    if not chunk.strip():
+        return chunk
+
+    chunk_label = f"#{chunk_id + 1}" if chunk_id is not None else "n/a"
+    prompt = POST_EDIT_PROMPT_TEMPLATE.format(
+        language_display=language_info["display_name"], content=chunk
+    )
+
+    for attempt in range(1, MAX_POST_EDIT_ATTEMPTS + 1):
+        logger.info(
+            "Post-edit chunk %s attempt %s prompt:\n%s",
+            chunk_label,
+            attempt,
+            prompt,
+        )
+        response = llm_service(
+            prompt=prompt,
+            image=None,
+            block=None,
+            response_schema=PostEditResponse,
+            timeout=getattr(llm_service, "timeout", None),
+        )
+        logger.info(
+            "Post-edit chunk %s attempt %s raw response: %s",
+            chunk_label,
+            attempt,
+            response,
+        )
+
+        if isinstance(response, dict):
+            corrected_text = response.get("corrected_markdown", "")
+        else:
+            corrected_text = response.corrected_markdown
+
+        if not isinstance(corrected_text, str):
+            logger.warning("Post-edit payload missing text. Attempt %s", attempt)
+            continue
+
+        corrected_text = corrected_text.strip()
+        if not corrected_text:
+            continue
+
+        original_len = len(chunk.strip())
+        if original_len and len(corrected_text) < original_len * 0.5:
+            logger.warning(
+                "Post-edit chunk %s attempt %s looked truncated; skipping replacement.",
+                chunk_label,
+                attempt,
+            )
+            continue
+
+        return corrected_text
+
+    logger.warning("Post-edit failed for chunk %s; keeping original chunk.", chunk_label)
+    return chunk
+
+
 def translate_rendered_output(
     rendered: MarkdownOutput,
     target_language: str,
@@ -321,13 +405,21 @@ def translate_rendered_output(
         _translate_chunk(llm_service, chunk, language_info, chunk_id=idx)
         for idx, chunk in enumerate(chunks)
     ]
-    rendered.markdown = "".join(translated_segments)
+    post_processed_segments = translated_segments
+    if ENABLE_TRANSLATION_POST_EDIT:
+        post_processed_segments = [
+            _post_edit_chunk(llm_service, segment, language_info, chunk_id=idx)
+            for idx, segment in enumerate(translated_segments)
+        ]
+
+    rendered.markdown = "".join(post_processed_segments)
 
     translation_meta = rendered.metadata.setdefault("translation", {})
     translation_meta.update(
         {
             "target_language": language_info["display_name"],
             "translator": llm_service.__class__.__name__,
+            "post_edit_enabled": ENABLE_TRANSLATION_POST_EDIT,
         }
     )
 
